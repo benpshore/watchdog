@@ -700,3 +700,73 @@ class TestErrorTextBounding:
         assert error is not None
         assert len(error) <= 120
         assert error.startswith("ValueError:")
+
+
+class TestCheckSchedulingSemantics:
+    """Test that checks use eager evaluation, not interval-based scheduling."""
+
+    def test_check_runs_on_every_evaluate(self):
+        """Test that check is run on every evaluate() call, not throttled by interval."""
+        watchdog = Watchdog()
+        call_count = [0]
+
+        def counting_check():
+            call_count[0] += 1
+            return True
+
+        # Register with 30-second interval
+        watchdog.register_check("cache", check=counting_check, interval_seconds=30)
+
+        # First evaluate
+        watchdog.evaluate()
+        assert call_count[0] == 1
+
+        # Second evaluate immediately after (within interval)
+        watchdog.evaluate()
+        assert call_count[0] == 2  # Check was run again, not throttled
+
+        # Third evaluate
+        watchdog.evaluate()
+        assert call_count[0] == 3
+
+    def test_interval_seconds_is_metadata_only(self):
+        """Test that interval_seconds parameter doesn't control execution frequency."""
+        watchdog = Watchdog()
+        call_count = [0]
+
+        def counting_check():
+            call_count[0] += 1
+            return True
+
+        # Register with very large interval (should not prevent execution)
+        watchdog.register_check(
+            "service", check=counting_check, interval_seconds=999999
+        )
+
+        watchdog.evaluate()
+        watchdog.evaluate()
+
+        # Both evaluate() calls should have run the check
+        assert call_count[0] == 2
+
+    def test_last_check_time_updated_on_every_evaluate(self):
+        """Test that last_check_time is updated on every evaluate() call."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+
+        clock_time[0] = 10.0
+        eval1 = watchdog.evaluate()
+        assert eval1.items["cache"].last_check_time == 10.0
+
+        clock_time[0] = 20.0
+        eval2 = watchdog.evaluate()
+        assert eval2.items["cache"].last_check_time == 20.0
+
+        clock_time[0] = 25.0
+        eval3 = watchdog.evaluate()
+        assert eval3.items["cache"].last_check_time == 25.0

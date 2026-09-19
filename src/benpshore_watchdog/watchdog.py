@@ -32,7 +32,11 @@ class Transition(NamedTuple):
 
 @dataclass(frozen=True)
 class ItemStatus:
-    """Current status of a single monitored item."""
+    """Current status of a single monitored item.
+
+    For heartbeats: last_heartbeat is when the heartbeat was recorded.
+    For checks: last_check_time is when the check was executed (during evaluate()).
+    """
 
     name: str
     status: Status
@@ -106,14 +110,21 @@ class Watchdog:
     ) -> None:
         """Register a health check.
 
+        The check is executed synchronously on every evaluate() call.
+        The interval_seconds parameter is metadata for your application;
+        it is not enforced by the watchdog.
+
         Args:
             name: Unique name for this check.
-            check: Callable that returns True if healthy.
-            interval_seconds: Expected frequency of checks.
+            check: Callable that returns True if healthy, False if failed.
+                   Must return strictly bool (not truthy/falsy).
+            interval_seconds: Metadata: your application can use this when deciding
+                            how often to call evaluate(). The watchdog does not throttle
+                            based on this value.
 
         Raises:
             InvalidNameError: If name is empty or contains invalid characters.
-            InvalidIntervalError: If interval is invalid.
+            InvalidIntervalError: If interval is not a finite positive real number.
             ValueError: If name is already registered.
         """
         self._validate_name(name)
@@ -172,8 +183,13 @@ class Watchdog:
     def evaluate(self) -> Evaluation:
         """Evaluate current watchdog state.
 
+        Synchronously executes all registered health checks and evaluates
+        all heartbeats against their timeouts. The returned snapshot captures
+        state at the moment the clock was sampled.
+
         Returns:
-            Evaluation containing item statuses and any state transitions.
+            Evaluation containing item statuses and any state transitions that
+            occurred since the last call to evaluate().
         """
         current_time = self._clock()
 
