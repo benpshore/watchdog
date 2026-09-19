@@ -174,40 +174,6 @@ class TestHealthChecks:
         assert len(eval_result.items["cache"].last_error) <= 120
 
 
-class TestGracePeriod:
-    """Test grace period behavior for checks."""
-
-    def test_check_with_grace_period(self):
-        """Test that grace period allows check not to be called within interval."""
-        clock_time = [0.0]
-
-        def clock():
-            return clock_time[0]
-
-        check_count = [0]
-
-        def check_fn():
-            check_count[0] += 1
-            return False
-
-        watchdog = Watchdog(monotonic_clock=clock)
-        watchdog.register_check(
-            "cache",
-            check=check_fn,
-            interval_seconds=30,
-            grace_seconds=5,
-        )
-
-        clock_time[0] = 0.0
-        eval1 = watchdog.evaluate()
-        assert eval1.items["cache"].status == Status.FAILED
-
-        clock_time[0] = 15.0
-        watchdog.evaluate()
-        # Check that we marked stale after interval + grace expired
-        # But not within the grace period
-
-
 class TestValidation:
     """Test name and interval validation."""
 
@@ -258,17 +224,6 @@ class TestValidation:
         watchdog = Watchdog()
         with pytest.raises(InvalidIntervalError):
             watchdog.register_check("cache", check=lambda: True, interval_seconds=-1)
-
-    def test_negative_grace_period(self):
-        """Test that negative grace period is rejected."""
-        watchdog = Watchdog()
-        with pytest.raises(InvalidIntervalError):
-            watchdog.register_check(
-                "cache",
-                check=lambda: True,
-                interval_seconds=30,
-                grace_seconds=-1,
-            )
 
     def test_duplicate_name_heartbeat_then_check(self):
         """Test that duplicate names across types are rejected."""

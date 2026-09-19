@@ -93,7 +93,6 @@ watchdog.register_check(
     "cache",
     check=lambda: len(cache) > 0,
     interval_seconds=30,  # Check roughly every 30s
-    grace_seconds=5,      # Grace period after check; optional
 )
 
 # Evaluate
@@ -226,14 +225,13 @@ assert result.items["worker"].status == Status.HEALTHY
 
 Create a watchdog. Optionally inject a clock for testing.
 
-### `register_check(name, check, interval_seconds, grace_seconds=0)`
+### `register_check(name, check, interval_seconds)`
 
 Register a health check.
 
 - `name` (str): Unique name
 - `check` (Callable[[], bool]): Returns True if healthy
 - `interval_seconds` (float): Expected check interval
-- `grace_seconds` (float): Grace period (optional)
 
 Raises `InvalidNameError`, `InvalidIntervalError`, or `ValueError` if duplicate.
 
