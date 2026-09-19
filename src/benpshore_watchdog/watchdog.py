@@ -254,6 +254,8 @@ class Watchdog:
             return Status.UNKNOWN, None
 
         elapsed = current_time - last_hb
+        if elapsed < 0:
+            return Status.UNKNOWN, None
         if elapsed <= timeout:
             return Status.HEALTHY, None
 
