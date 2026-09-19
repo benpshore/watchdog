@@ -770,3 +770,119 @@ class TestCheckSchedulingSemantics:
         clock_time[0] = 25.0
         eval3 = watchdog.evaluate()
         assert eval3.items["cache"].last_check_time == 25.0
+
+
+class TestConcurrentSafety:
+    """Test concurrent safety and lock scope."""
+
+    def test_blocking_check_does_not_block_heartbeat(self):
+        """Test that slow check callbacks don't block heartbeat recording."""
+        import threading
+
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_check(
+            "slow_check", check=lambda: True, interval_seconds=30
+        )
+        watchdog.register_heartbeat("worker", timeout_seconds=60)
+
+        check_called = threading.Event()
+        check_done = threading.Event()
+        heartbeat_recorded = threading.Event()
+
+        def slow_check():
+            check_called.set()
+            # Simulate slow callback (would block if callback ran inside lock)
+            check_done.wait(timeout=1.0)
+            return True
+
+        # Replace the check with slow version
+        watchdog._checks["slow_check"]["check"] = slow_check
+
+        results = []
+
+        def evaluate_thread():
+            results.append(watchdog.evaluate())
+
+        def heartbeat_thread():
+            check_called.wait(timeout=1.0)
+            # Record heartbeat while check is still running
+            watchdog.heartbeat("worker")
+            heartbeat_recorded.set()
+            check_done.set()
+
+        # Set initial clock time
+        clock_time[0] = 10.0
+
+        eval_t = threading.Thread(target=evaluate_thread)
+        beat_t = threading.Thread(target=heartbeat_thread)
+
+        eval_t.start()
+        beat_t.start()
+
+        # Simulate time passing during slow check execution
+        import time
+
+        time.sleep(0.01)
+        clock_time[0] = 15.0
+
+        eval_t.join(timeout=5.0)
+        beat_t.join(timeout=5.0)
+
+        # Heartbeat should have been recorded despite slow check
+        assert heartbeat_recorded.is_set()
+        assert len(results) == 1
+        # The evaluation happened after heartbeat was recorded
+        assert results[0].items["worker"].last_heartbeat is not None
+
+    def test_timestamp_ordering_consistency(self):
+        """Test that evaluation timestamp is consistent with recorded heartbeat times."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_heartbeat("worker", timeout_seconds=60)
+
+        clock_time[0] = 10.0
+        watchdog.heartbeat("worker")
+
+        clock_time[0] = 20.0
+        eval_result = watchdog.evaluate()
+
+        # The evaluation was at 20.0, heartbeat was at 10.0
+        # So heartbeat should be considered healthy (within 60s)
+        assert eval_result.items["worker"].status == Status.HEALTHY
+        assert eval_result.items["worker"].last_heartbeat == 10.0
+        assert eval_result.timestamp == 20.0
+
+        # Now move beyond timeout
+        clock_time[0] = 75.0
+        eval_result2 = watchdog.evaluate()
+        assert eval_result2.items["worker"].status == Status.STALE
+
+    def test_callback_exception_does_not_affect_other_checks(self):
+        """Test that one check exception doesn't affect other check execution."""
+        watchdog = Watchdog()
+
+        def failing_check():
+            raise RuntimeError("check failed")
+
+        def passing_check():
+            return True
+
+        watchdog.register_check("bad", check=failing_check, interval_seconds=30)
+        watchdog.register_check("good", check=passing_check, interval_seconds=30)
+
+        eval_result = watchdog.evaluate()
+
+        # Both should be evaluated despite one failing
+        assert eval_result.items["bad"].status == Status.FAILED
+        assert eval_result.items["bad"].last_error is not None
+        assert eval_result.items["good"].status == Status.HEALTHY
+        assert eval_result.items["good"].last_error is None
