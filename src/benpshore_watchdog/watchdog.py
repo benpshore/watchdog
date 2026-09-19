@@ -90,7 +90,6 @@ class Watchdog:
         self._checks: dict[str, dict[str, Any]] = {}
         self._heartbeats: dict[str, dict[str, Any]] = {}
         self._statuses: dict[str, Status] = {}
-        self._last_values: dict[str, Any | None] = {}
         self._transitions: deque[Transition] = deque(maxlen=self.MAX_HISTORY_EVENTS)
 
     def register_check(
@@ -98,7 +97,6 @@ class Watchdog:
         name: str,
         check: HealthCheckCallback,
         interval_seconds: float,
-        grace_seconds: float = 0,
     ) -> None:
         """Register a health check.
 
@@ -106,18 +104,16 @@ class Watchdog:
             name: Unique name for this check.
             check: Callable that returns True if healthy.
             interval_seconds: Expected frequency of checks.
-            grace_seconds: Grace period before marking stale.
 
         Raises:
             InvalidNameError: If name is empty or contains invalid characters.
-            InvalidIntervalError: If interval or grace is invalid.
+            InvalidIntervalError: If interval is invalid.
             ValueError: If name is already registered.
         """
         self._validate_name(name)
-        if interval_seconds <= 0 or grace_seconds < 0:
+        if interval_seconds <= 0:
             raise InvalidIntervalError(
-                f"interval_seconds must be >0, grace_seconds >=0; "
-                f"got interval={interval_seconds}, grace={grace_seconds}"
+                f"interval_seconds must be >0; got {interval_seconds}"
             )
 
         with self._lock:
@@ -127,11 +123,9 @@ class Watchdog:
             self._checks[name] = {
                 "check": check,
                 "interval_seconds": interval_seconds,
-                "grace_seconds": grace_seconds,
                 "last_check_time": None,
             }
             self._statuses[name] = Status.UNKNOWN
-            self._last_values[name] = None
 
     def register_heartbeat(
         self,
@@ -164,7 +158,6 @@ class Watchdog:
                 "last_heartbeat": None,
             }
             self._statuses[name] = Status.UNKNOWN
-            self._last_values[name] = None
 
     def heartbeat(self, name: str) -> None:
         """Record a heartbeat for a named item.
@@ -194,7 +187,7 @@ class Watchdog:
 
             # Evaluate health checks
             for name, check_cfg in self._checks.items():
-                status, _, error = self._eval_check(
+                status, error = self._eval_check(
                     name, check_cfg, current_time
                 )
                 self._record_transition(name, status, new_transitions, current_time)
@@ -235,23 +228,23 @@ class Watchdog:
 
     def _eval_check(
         self, name: str, check_cfg: dict[str, Any], current_time: float
-    ) -> tuple[Status, str, str | None]:
+    ) -> tuple[Status, str | None]:
         """Evaluate a single health check.
 
         Returns:
-            (status, reason, error_text or None)
+            (status, error_text or None)
         """
         try:
             result = check_cfg["check"]()
             check_cfg["last_check_time"] = current_time
             if result:
-                return Status.HEALTHY, "check passed", None
+                return Status.HEALTHY, None
             else:
-                return Status.FAILED, "check returned False", None
+                return Status.FAILED, None
         except Exception as e:  # noqa: BLE001
             check_cfg["last_check_time"] = current_time
             error_text = f"{type(e).__name__}: {str(e)[:100]}"
-            return Status.FAILED, "check raised exception", error_text
+            return Status.FAILED, error_text
 
     def _eval_heartbeat(
         self, name: str, hb_cfg: dict[str, Any], current_time: float
