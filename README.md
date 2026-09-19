@@ -43,8 +43,8 @@ From the repository:
 ```bash
 git clone <repo-url>
 cd watchdog
-uv sync
-uv run pip install -e .
+uv sync --all-extras --locked
+uv run --locked pytest
 ```
 
 Or add to your `pyproject.toml`:
