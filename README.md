@@ -297,6 +297,7 @@ Get bounded history of state transitions (up to 1000).
 ```python
 from benpshore_watchdog import Watchdog
 import time
+import threading
 
 watchdog = Watchdog()
 
@@ -325,9 +326,15 @@ def monitor_health():
         time.sleep(1)
 
 if __name__ == "__main__":
-    # Start both in a real app; for example, with threading
-    background_worker()
-    monitor_health()
+    # Run both concurrently in separate threads
+    worker_thread = threading.Thread(target=background_worker)
+    monitor_thread = threading.Thread(target=monitor_health)
+    
+    worker_thread.start()
+    monitor_thread.start()
+    
+    worker_thread.join()
+    monitor_thread.join()
 ```
 
 ## Contributing

@@ -886,3 +886,92 @@ class TestConcurrentSafety:
         assert eval_result.items["bad"].last_error is not None
         assert eval_result.items["good"].status == Status.HEALTHY
         assert eval_result.items["good"].last_error is None
+
+
+class TestMalformedNumericInput:
+    """Test handling of malformed numeric input."""
+
+    def test_reject_string_interval(self):
+        """Test that string timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds="60")  # type: ignore
+
+    def test_reject_none_interval(self):
+        """Test that None interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=None)  # type: ignore
+
+    def test_reject_negative_interval(self):
+        """Test that negative interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=-1.0)
+
+    def test_reject_zero_interval(self):
+        """Test that zero interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=0.0)
+
+
+class TestBoundedHistoryEviction:
+    """Test that history is actually bounded and old events evicted."""
+
+    def test_history_truly_bounded_at_max(self):
+        """Test that history is capped at MAX_HISTORY_EVENTS."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_heartbeat("hb", timeout_seconds=1)
+
+        # Generate enough transitions to exceed MAX_HISTORY_EVENTS
+        # Each heartbeat + state change can generate a transition
+        # We need to create enough state changes
+        for i in range(watchdog.MAX_HISTORY_EVENTS + 100):
+            clock_time[0] = i * 2.0
+            if i % 2 == 0:
+                watchdog.heartbeat("hb")
+            else:
+                # Skip heartbeat to create STALE -> UNKNOWN transitions
+                pass
+            watchdog.evaluate()
+
+        history = watchdog.get_history()
+        # History should be bounded at MAX_HISTORY_EVENTS
+        assert len(history) <= watchdog.MAX_HISTORY_EVENTS
+        # Should have exactly MAX_HISTORY_EVENTS (deque is full)
+        assert len(history) == watchdog.MAX_HISTORY_EVENTS
+
+    def test_oldest_events_actually_removed(self):
+        """Test that oldest transitions are removed when limit exceeded."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_heartbeat("hb", timeout_seconds=1)
+
+        # Generate first transition at time 0
+        clock_time[0] = 0.0
+        watchdog.heartbeat("hb")
+        eval1 = watchdog.evaluate()
+        first_timestamp = eval1.transitions[0].timestamp if eval1.transitions else None
+
+        # Generate many transitions to exceed MAX_HISTORY_EVENTS
+        for i in range(watchdog.MAX_HISTORY_EVENTS + 100):
+            clock_time[0] = 100 + i * 2.0
+            if i % 2 == 0:
+                watchdog.heartbeat("hb")
+            watchdog.evaluate()
+
+        history = watchdog.get_history()
+        # The oldest event should NOT be the first one we created
+        # (it should have been evicted)
+        if first_timestamp is not None and len(history) > 0:
+            assert history[0].timestamp > first_timestamp
