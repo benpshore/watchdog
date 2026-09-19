@@ -111,15 +111,10 @@ class Watchdog:
             ValueError: If name is already registered.
         """
         self._validate_name(name)
-        if interval_seconds <= 0:
-            raise InvalidIntervalError(
-                f"interval_seconds must be >0; got {interval_seconds}"
-            )
+        self._validate_interval(interval_seconds)
 
         with self._lock:
-            if name in self._checks or name in self._heartbeats:
-                raise ValueError(f"Name '{name}' is already registered")
-
+            self._check_name_available(name)
             self._checks[name] = {
                 "check": check,
                 "interval_seconds": interval_seconds,
@@ -144,15 +139,10 @@ class Watchdog:
             ValueError: If name is already registered.
         """
         self._validate_name(name)
-        if timeout_seconds <= 0:
-            raise InvalidIntervalError(
-                f"timeout_seconds must be >0; got {timeout_seconds}"
-            )
+        self._validate_interval(timeout_seconds)
 
         with self._lock:
-            if name in self._checks or name in self._heartbeats:
-                raise ValueError(f"Name '{name}' is already registered")
-
+            self._check_name_available(name)
             self._heartbeats[name] = {
                 "timeout_seconds": timeout_seconds,
                 "last_heartbeat": None,
@@ -200,7 +190,7 @@ class Watchdog:
 
             # Evaluate heartbeats
             for name, hb_cfg in self._heartbeats.items():
-                status = self._eval_heartbeat(name, hb_cfg, current_time)
+                status, _ = self._eval_heartbeat(name, hb_cfg, current_time)
                 self._record_transition(name, status, new_transitions, current_time)
                 statuses[name] = ItemStatus(
                     name=name,
@@ -243,28 +233,31 @@ class Watchdog:
                 return Status.FAILED, None
         except Exception as e:  # noqa: BLE001
             check_cfg["last_check_time"] = current_time
-            error_text = f"{type(e).__name__}: {str(e)[:100]}"
+            exc_name = type(e).__name__
+            exc_msg = str(e)
+            max_msg_len = max(1, 115 - len(exc_name) - 2)
+            error_text = f"{exc_name}: {exc_msg[:max_msg_len]}"
             return Status.FAILED, error_text
 
     def _eval_heartbeat(
         self, name: str, hb_cfg: dict[str, Any], current_time: float
-    ) -> Status:
+    ) -> tuple[Status, None]:
         """Evaluate a single heartbeat.
 
         Returns:
-            Status
+            (status, None)
         """
         last_hb = hb_cfg["last_heartbeat"]
         timeout = hb_cfg["timeout_seconds"]
 
         if last_hb is None:
-            return Status.UNKNOWN
+            return Status.UNKNOWN, None
 
         elapsed = current_time - last_hb
         if elapsed <= timeout:
-            return Status.HEALTHY
+            return Status.HEALTHY, None
 
-        return Status.STALE
+        return Status.STALE, None
 
     def _record_transition(
         self,
@@ -302,3 +295,21 @@ class Watchdog:
             raise InvalidNameError(
                 "Name must contain only alphanumeric characters, '-', '_', or '.'"
             )
+
+    def _validate_interval(self, value: float) -> None:
+        """Validate an interval or timeout value.
+
+        Raises:
+            InvalidIntervalError: If value is not positive.
+        """
+        if value <= 0:
+            raise InvalidIntervalError(f"Interval must be >0; got {value}")
+
+    def _check_name_available(self, name: str) -> None:
+        """Check that a name is not already registered.
+
+        Raises:
+            ValueError: If name is already registered.
+        """
+        if name in self._checks or name in self._heartbeats:
+            raise ValueError(f"Name '{name}' is already registered")
