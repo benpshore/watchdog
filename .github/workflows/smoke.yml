@@ -35,4 +35,5 @@ jobs:
         run: uv run pytest tests/ -v
 
       - name: Lint with ruff
+        if: matrix.python-version == '3.14'
         run: uv run ruff check src/ tests/
