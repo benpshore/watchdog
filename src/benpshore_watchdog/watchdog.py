@@ -228,7 +228,7 @@ class Watchdog:
             new_transitions: list[Transition] = []
 
             # Process evaluated checks
-            for name in self._checks.keys():
+            for name in self._checks:
                 if name in check_results:
                     status, error = check_results[name]
                     self._checks[name]["last_check_time"] = current_time
