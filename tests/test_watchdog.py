@@ -513,8 +513,190 @@ class TestEvaluationResult:
         watchdog = Watchdog()
         watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
         eval_result = watchdog.evaluate()
-        # Dataclass fields can be reassigned (not frozen by default)
-        # Just verify the structure is correct
-        assert hasattr(eval_result, "timestamp")
-        assert hasattr(eval_result, "items")
-        assert hasattr(eval_result, "transitions")
+
+        # Frozen dataclass: cannot assign to fields
+        with pytest.raises(AttributeError):
+            eval_result.timestamp = 100.0
+
+        with pytest.raises(AttributeError):
+            eval_result.items = {}
+
+        with pytest.raises(AttributeError):
+            eval_result.transitions = ()
+
+    def test_items_read_only_mapping(self):
+        """Test that items is a read-only mapping (MappingProxyType)."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+
+        # Cannot assign to the items dict
+        with pytest.raises(TypeError):
+            eval_result.items["new_key"] = None
+
+    def test_transitions_immutable_tuple(self):
+        """Test that transitions is an immutable tuple."""
+        watchdog = Watchdog()
+        watchdog.register_heartbeat("worker", timeout_seconds=1)
+        clock = [0.0]
+        watchdog_clock = Watchdog(monotonic_clock=lambda: clock[0])
+        watchdog_clock.register_heartbeat("worker", timeout_seconds=1)
+
+        clock[0] = 0.0
+        watchdog_clock.heartbeat("worker")
+        eval1 = watchdog_clock.evaluate()
+
+        # transitions should be a tuple (immutable)
+        assert isinstance(eval1.transitions, tuple)
+
+        # Cannot append to tuple
+        with pytest.raises(AttributeError):
+            eval1.transitions.append(None)
+
+
+class TestIntervalValidation:
+    """Test strictness of interval validation."""
+
+    def test_reject_nan_timeout(self):
+        """Test that NaN timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=float("nan"))
+
+    def test_reject_inf_timeout(self):
+        """Test that infinity timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=float("inf"))
+
+    def test_reject_nan_interval(self):
+        """Test that NaN interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_check(
+                "cache", check=lambda: True, interval_seconds=float("nan")
+            )
+
+    def test_reject_inf_interval(self):
+        """Test that infinity interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_check(
+                "cache", check=lambda: True, interval_seconds=float("inf")
+            )
+
+    def test_reject_bool_timeout(self):
+        """Test that boolean timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=True)
+
+    def test_reject_bool_interval(self):
+        """Test that boolean interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_check(
+                "cache", check=lambda: True, interval_seconds=False
+            )
+
+    def test_accept_positive_int(self):
+        """Test that positive int is accepted for interval."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+        # Should not raise
+
+    def test_accept_positive_float(self):
+        """Test that positive float is accepted for timeout."""
+        watchdog = Watchdog()
+        watchdog.register_heartbeat("worker", timeout_seconds=60.5)
+        # Should not raise
+
+
+class TestCheckReturnType:
+    """Test strict bool return type validation for health checks."""
+
+    def test_check_returns_string_fails(self):
+        """Test that check returning string is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: "yes", interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_int_fails(self):
+        """Test that check returning int is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: 1, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_none_fails(self):
+        """Test that check returning None is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: None, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_list_fails(self):
+        """Test that check returning list is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=list, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_true_succeeds(self):
+        """Test that check returning True is healthy."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.HEALTHY
+
+    def test_check_returns_false_fails(self):
+        """Test that check returning False is failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: False, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+
+
+class TestErrorTextBounding:
+    """Test error text truncation with various exception names."""
+
+    def test_error_text_with_long_exception_name(self):
+        """Test that error text is bounded even with long exception class name."""
+        watchdog = Watchdog()
+
+        class VeryLongExceptionNameThatIsReallyQuiteLongIndeed(Exception):
+            pass
+
+        def bad_check():
+            raise VeryLongExceptionNameThatIsReallyQuiteLongIndeed(
+                "this is a very long error message that might exceed the truncation limit"
+            )
+
+        watchdog.register_check("service", check=bad_check, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+
+        # Error text should be truncated and fit within reasonable bounds
+        error = eval_result.items["service"].last_error
+        assert error is not None
+        assert len(error) <= 120  # Original limit
+        assert "VeryLongExceptionNameThatIsReallyQuiteLongIndeed" in error
+
+    def test_error_text_truncation_normal_case(self):
+        """Test error text truncation in normal case."""
+        watchdog = Watchdog()
+
+        def bad_check():
+            raise ValueError("a" * 200)  # Very long message
+
+        watchdog.register_check("service", check=bad_check, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+
+        error = eval_result.items["service"].last_error
+        assert error is not None
+        assert len(error) <= 120
+        assert error.startswith("ValueError:")

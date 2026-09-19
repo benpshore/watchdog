@@ -13,6 +13,8 @@ This library helps applications monitor their own health by:
 
 It's intentionally small and synchronous. Your application owns all decisions and remediation.
 
+**Important:** This library is _not yet published to PyPI_. For development and testing, install from the repository.
+
 ## What it deliberately does NOT do
 
 - **Not a daemon or service manager** — no background threads or continuous monitoring
@@ -26,7 +28,8 @@ It's intentionally small and synchronous. Your application owns all decisions an
 The watchdog is a **passive observer**. It:
 
 - Records what you tell it (health checks, heartbeats)
-- Returns structured, immutable results on demand
+- Returns immutable result snapshots on demand (read-only mappings and tuples)
+- Evaluates all registered checks and heartbeats synchronously on each `evaluate()` call
 - Uses `time.monotonic()` for all elapsed-time calculations (immune to clock skew)
 - Thread-safe for concurrent access
 - Bounded history (retains only the most recent 1000 state-transition events)
@@ -35,8 +38,21 @@ The watchdog is a **passive observer**. It:
 
 ## Install
 
+From the repository:
+
 ```bash
-uv add benpshore-watchdog
+git clone <repo-url>
+cd watchdog
+uv sync
+uv run pip install -e .
+```
+
+Or add to your `pyproject.toml`:
+
+```toml
+dependencies = [
+    "benpshore-watchdog @ file:///<path-to-watchdog>",
+]
 ```
 
 ## Quick start
@@ -86,16 +102,18 @@ for transition in evaluation.transitions:
 
 ## Health checks
 
-A health check is a callable that returns `True` (healthy) or `False` (failed). If it raises an exception, it's caught and recorded as a failed status with safe diagnostic text.
+A health check is a callable that returns strictly `True` (healthy) or `False` (failed). The callback must return a boolean; truthy/falsy values are rejected. If it raises an exception, it's caught and recorded as a failed status with diagnostic text.
+
+The `interval_seconds` parameter is validated but not enforced by the watchdog. It's metadata for your application to use when deciding how often to call `evaluate()`.
 
 ```python
 watchdog.register_check(
     "cache",
     check=lambda: len(cache) > 0,
-    interval_seconds=30,  # Check roughly every 30s
+    interval_seconds=30,  # Metadata: your app can use this to throttle evaluate()
 )
 
-# Evaluate
+# Evaluate — this runs the check synchronously
 result = watchdog.evaluate()
 print(result.items["cache"].status)  # Status.HEALTHY or Status.FAILED
 ```
@@ -109,9 +127,22 @@ def risky_check():
 watchdog.register_check("service", check=risky_check, interval_seconds=30)
 result = watchdog.evaluate()
 
-# Status is FAILED, error text is safe and truncated
+# Status is FAILED, error text is captured
 print(result.items["service"].status)      # Status.FAILED
 print(result.items["service"].last_error)  # "ConnectionError: cannot reach service"
+```
+
+**Non-bool return values are rejected:**
+
+```python
+def bad_check():
+    return "yes"  # Not a bool!
+
+watchdog.register_check("bad", check=bad_check, interval_seconds=30)
+result = watchdog.evaluate()
+
+print(result.items["bad"].status)      # Status.FAILED
+print(result.items["bad"].last_error)  # "Check must return bool, got str"
 ```
 
 ## Heartbeats
@@ -230,19 +261,19 @@ Create a watchdog. Optionally inject a clock for testing.
 Register a health check.
 
 - `name` (str): Unique name
-- `check` (Callable[[], bool]): Returns True if healthy
-- `interval_seconds` (float): Expected check interval
+- `check` (Callable[[], bool]): Must return strictly `True` or `False` (non-bool values cause FAILED status)
+- `interval_seconds` (float): Metadata for your application (must be positive, real number; not nan/inf/bool)
 
-Raises `InvalidNameError`, `InvalidIntervalError`, or `ValueError` if duplicate.
+Raises `InvalidNameError`, `InvalidIntervalError`, or `ValueError` if duplicate or if interval_seconds is not a finite positive real number.
 
 ### `register_heartbeat(name, timeout_seconds)`
 
 Register a heartbeat.
 
 - `name` (str): Unique name
-- `timeout_seconds` (float): Timeout before stale
+- `timeout_seconds` (float): Timeout before marking stale (must be positive, real number; not nan/inf/bool)
 
-Raises `InvalidNameError`, `InvalidIntervalError`, or `ValueError` if duplicate.
+Raises `InvalidNameError`, `InvalidIntervalError`, or `ValueError` if duplicate or if timeout_seconds is not a finite positive real number.
 
 ### `heartbeat(name)`
 
@@ -250,11 +281,11 @@ Record a heartbeat for a registered item. Raises `KeyError` if not registered as
 
 ### `evaluate() -> Evaluation`
 
-Evaluate current state. Returns:
+Evaluate current state synchronously (runs all registered checks). Returns an immutable snapshot:
 
 - `timestamp` (float): Evaluation time (from clock)
-- `items` (Dict[str, ItemStatus]): Status of each monitored item
-- `transitions` (List[Transition]): State changes since last evaluation
+- `items` (MappingProxyType[str, ItemStatus]): Read-only mapping of item statuses
+- `transitions` (Tuple[Transition, ...]): Immutable tuple of state changes since last evaluation
 - `is_healthy()`: True if all items are healthy
 
 ### `get_history() -> List[Transition]`

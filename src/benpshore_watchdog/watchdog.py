@@ -1,11 +1,13 @@
 """Core watchdog implementation for cooperative health monitoring."""
 
+import math
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 
@@ -28,7 +30,7 @@ class Transition(NamedTuple):
     reason: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class ItemStatus:
     """Current status of a single monitored item."""
 
@@ -39,13 +41,17 @@ class ItemStatus:
     last_error: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Evaluation:
-    """Result of evaluating watchdog state at a point in time."""
+    """Result of evaluating watchdog state at a point in time.
+
+    Immutable snapshot of watchdog state. items is a read-only mapping,
+    and transitions is a read-only sequence.
+    """
 
     timestamp: float
-    items: dict[str, ItemStatus] = field(default_factory=dict)
-    transitions: list[Transition] = field(default_factory=list)
+    items: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
+    transitions: tuple[Transition, ...] = field(default_factory=tuple)
 
     def is_healthy(self) -> bool:
         """Return True if all items are healthy."""
@@ -203,8 +209,8 @@ class Watchdog:
 
             return Evaluation(
                 timestamp=current_time,
-                items=statuses,
-                transitions=new_transitions,
+                items=MappingProxyType(statuses),
+                transitions=tuple(new_transitions),
             )
 
     def get_history(self) -> list[Transition]:
@@ -227,6 +233,9 @@ class Watchdog:
         try:
             result = check_cfg["check"]()
             check_cfg["last_check_time"] = current_time
+            if not isinstance(result, bool):
+                error_text = f"Check must return bool, got {type(result).__name__}"
+                return Status.FAILED, error_text
             if result:
                 return Status.HEALTHY, None
             else:
@@ -302,9 +311,13 @@ class Watchdog:
         """Validate an interval or timeout value.
 
         Raises:
-            InvalidIntervalError: If value is not positive.
+            InvalidIntervalError: If value is not a finite positive real number.
         """
-        if value <= 0:
+        if isinstance(value, bool):
+            raise InvalidIntervalError(f"Interval must be >0; got {value}")
+        if not isinstance(value, (int, float)):
+            raise InvalidIntervalError(f"Interval must be >0; got {value}")
+        if math.isnan(value) or math.isinf(value) or value <= 0:
             raise InvalidIntervalError(f"Interval must be >0; got {value}")
 
     def _check_name_available(self, name: str) -> None:
