@@ -1,0 +1,47 @@
+name: Request Codex review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  request-review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Request review for this PR revision
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const marker = `<!-- codex-review-request:${pr.head.sha} -->`;
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100,
+              },
+            );
+
+            if (comments.some((comment) => comment.body?.includes(marker))) {
+              core.info("Codex review already requested for this PR revision.");
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: `${marker}
+@codex review
+
+Review this pull request revision for consequential correctness, concurrency, API-contract, and test-coverage defects. Ignore formatting and other mechanical CI concerns.`,
+            });
