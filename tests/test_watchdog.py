@@ -513,8 +513,465 @@ class TestEvaluationResult:
         watchdog = Watchdog()
         watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
         eval_result = watchdog.evaluate()
-        # Dataclass fields can be reassigned (not frozen by default)
-        # Just verify the structure is correct
-        assert hasattr(eval_result, "timestamp")
-        assert hasattr(eval_result, "items")
-        assert hasattr(eval_result, "transitions")
+
+        # Frozen dataclass: cannot assign to fields
+        with pytest.raises(AttributeError):
+            eval_result.timestamp = 100.0
+
+        with pytest.raises(AttributeError):
+            eval_result.items = {}
+
+        with pytest.raises(AttributeError):
+            eval_result.transitions = ()
+
+    def test_items_read_only_mapping(self):
+        """Test that items is a read-only mapping (MappingProxyType)."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+
+        # Cannot assign to the items dict
+        with pytest.raises(TypeError):
+            eval_result.items["new_key"] = None
+
+    def test_transitions_immutable_tuple(self):
+        """Test that transitions is an immutable tuple."""
+        watchdog = Watchdog()
+        watchdog.register_heartbeat("worker", timeout_seconds=1)
+        clock = [0.0]
+        watchdog_clock = Watchdog(monotonic_clock=lambda: clock[0])
+        watchdog_clock.register_heartbeat("worker", timeout_seconds=1)
+
+        clock[0] = 0.0
+        watchdog_clock.heartbeat("worker")
+        eval1 = watchdog_clock.evaluate()
+
+        # transitions should be a tuple (immutable)
+        assert isinstance(eval1.transitions, tuple)
+
+        # Cannot append to tuple
+        with pytest.raises(AttributeError):
+            eval1.transitions.append(None)
+
+
+class TestIntervalValidation:
+    """Test strictness of interval validation."""
+
+    def test_reject_nan_timeout(self):
+        """Test that NaN timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=float("nan"))
+
+    def test_reject_inf_timeout(self):
+        """Test that infinity timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=float("inf"))
+
+    def test_reject_nan_interval(self):
+        """Test that NaN interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_check(
+                "cache", check=lambda: True, interval_seconds=float("nan")
+            )
+
+    def test_reject_inf_interval(self):
+        """Test that infinity interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_check(
+                "cache", check=lambda: True, interval_seconds=float("inf")
+            )
+
+    def test_reject_bool_timeout(self):
+        """Test that boolean timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=True)
+
+    def test_reject_bool_interval(self):
+        """Test that boolean interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_check(
+                "cache", check=lambda: True, interval_seconds=False
+            )
+
+    def test_accept_positive_int(self):
+        """Test that positive int is accepted for interval."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+        # Should not raise
+
+    def test_accept_positive_float(self):
+        """Test that positive float is accepted for timeout."""
+        watchdog = Watchdog()
+        watchdog.register_heartbeat("worker", timeout_seconds=60.5)
+        # Should not raise
+
+
+class TestCheckReturnType:
+    """Test strict bool return type validation for health checks."""
+
+    def test_check_returns_string_fails(self):
+        """Test that check returning string is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: "yes", interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_int_fails(self):
+        """Test that check returning int is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: 1, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_none_fails(self):
+        """Test that check returning None is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: None, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_list_fails(self):
+        """Test that check returning list is marked failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=list, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+        assert "Check must return bool" in eval_result.items["cache"].last_error
+
+    def test_check_returns_true_succeeds(self):
+        """Test that check returning True is healthy."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.HEALTHY
+
+    def test_check_returns_false_fails(self):
+        """Test that check returning False is failed."""
+        watchdog = Watchdog()
+        watchdog.register_check("cache", check=lambda: False, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+        assert eval_result.items["cache"].status == Status.FAILED
+
+
+class TestErrorTextBounding:
+    """Test error text truncation with various exception names."""
+
+    def test_error_text_with_long_exception_name(self):
+        """Test that error text is bounded even with long exception class name."""
+        watchdog = Watchdog()
+
+        class VeryLongExceptionNameThatIsReallyQuiteLongIndeed(Exception):
+            pass
+
+        def bad_check():
+            raise VeryLongExceptionNameThatIsReallyQuiteLongIndeed(
+                "this is a very long error message that might exceed the truncation limit"
+            )
+
+        watchdog.register_check("service", check=bad_check, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+
+        # Error text should be truncated and fit within reasonable bounds
+        error = eval_result.items["service"].last_error
+        assert error is not None
+        assert len(error) <= 120  # Original limit
+        assert "VeryLongExceptionNameThatIsReallyQuiteLongIndeed" in error
+
+    def test_error_text_truncation_normal_case(self):
+        """Test error text truncation in normal case."""
+        watchdog = Watchdog()
+
+        def bad_check():
+            raise ValueError("a" * 200)  # Very long message
+
+        watchdog.register_check("service", check=bad_check, interval_seconds=30)
+        eval_result = watchdog.evaluate()
+
+        error = eval_result.items["service"].last_error
+        assert error is not None
+        assert len(error) <= 120
+        assert error.startswith("ValueError:")
+
+
+class TestCheckSchedulingSemantics:
+    """Test that checks use eager evaluation, not interval-based scheduling."""
+
+    def test_check_runs_on_every_evaluate(self):
+        """Test that check is run on every evaluate() call, not throttled by interval."""
+        watchdog = Watchdog()
+        call_count = [0]
+
+        def counting_check():
+            call_count[0] += 1
+            return True
+
+        # Register with 30-second interval
+        watchdog.register_check("cache", check=counting_check, interval_seconds=30)
+
+        # First evaluate
+        watchdog.evaluate()
+        assert call_count[0] == 1
+
+        # Second evaluate immediately after (within interval)
+        watchdog.evaluate()
+        assert call_count[0] == 2  # Check was run again, not throttled
+
+        # Third evaluate
+        watchdog.evaluate()
+        assert call_count[0] == 3
+
+    def test_interval_seconds_is_metadata_only(self):
+        """Test that interval_seconds parameter doesn't control execution frequency."""
+        watchdog = Watchdog()
+        call_count = [0]
+
+        def counting_check():
+            call_count[0] += 1
+            return True
+
+        # Register with very large interval (should not prevent execution)
+        watchdog.register_check(
+            "service", check=counting_check, interval_seconds=999999
+        )
+
+        watchdog.evaluate()
+        watchdog.evaluate()
+
+        # Both evaluate() calls should have run the check
+        assert call_count[0] == 2
+
+    def test_last_check_time_updated_on_every_evaluate(self):
+        """Test that last_check_time is updated on every evaluate() call."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_check("cache", check=lambda: True, interval_seconds=30)
+
+        clock_time[0] = 10.0
+        eval1 = watchdog.evaluate()
+        assert eval1.items["cache"].last_check_time == 10.0
+
+        clock_time[0] = 20.0
+        eval2 = watchdog.evaluate()
+        assert eval2.items["cache"].last_check_time == 20.0
+
+        clock_time[0] = 25.0
+        eval3 = watchdog.evaluate()
+        assert eval3.items["cache"].last_check_time == 25.0
+
+
+class TestConcurrentSafety:
+    """Test concurrent safety and lock scope."""
+
+    def test_blocking_check_does_not_block_heartbeat(self):
+        """Test that slow check callbacks don't block heartbeat recording."""
+        import threading
+
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_check(
+            "slow_check", check=lambda: True, interval_seconds=30
+        )
+        watchdog.register_heartbeat("worker", timeout_seconds=60)
+
+        check_called = threading.Event()
+        check_done = threading.Event()
+        heartbeat_recorded = threading.Event()
+
+        def slow_check():
+            check_called.set()
+            # Simulate slow callback (would block if callback ran inside lock)
+            check_done.wait(timeout=1.0)
+            return True
+
+        # Replace the check with slow version
+        watchdog._checks["slow_check"]["check"] = slow_check
+
+        results = []
+
+        def evaluate_thread():
+            results.append(watchdog.evaluate())
+
+        def heartbeat_thread():
+            check_called.wait(timeout=1.0)
+            # Record heartbeat while check is still running
+            watchdog.heartbeat("worker")
+            heartbeat_recorded.set()
+            check_done.set()
+
+        # Set initial clock time
+        clock_time[0] = 10.0
+
+        eval_t = threading.Thread(target=evaluate_thread)
+        beat_t = threading.Thread(target=heartbeat_thread)
+
+        eval_t.start()
+        beat_t.start()
+
+        # Simulate time passing during slow check execution
+        import time
+
+        time.sleep(0.01)
+        clock_time[0] = 15.0
+
+        eval_t.join(timeout=5.0)
+        beat_t.join(timeout=5.0)
+
+        # Heartbeat should have been recorded despite slow check
+        assert heartbeat_recorded.is_set()
+        assert len(results) == 1
+        # The evaluation happened after heartbeat was recorded
+        assert results[0].items["worker"].last_heartbeat is not None
+
+    def test_timestamp_ordering_consistency(self):
+        """Test that evaluation timestamp is consistent with recorded heartbeat times."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_heartbeat("worker", timeout_seconds=60)
+
+        clock_time[0] = 10.0
+        watchdog.heartbeat("worker")
+
+        clock_time[0] = 20.0
+        eval_result = watchdog.evaluate()
+
+        # The evaluation was at 20.0, heartbeat was at 10.0
+        # So heartbeat should be considered healthy (within 60s)
+        assert eval_result.items["worker"].status == Status.HEALTHY
+        assert eval_result.items["worker"].last_heartbeat == 10.0
+        assert eval_result.timestamp == 20.0
+
+        # Now move beyond timeout
+        clock_time[0] = 75.0
+        eval_result2 = watchdog.evaluate()
+        assert eval_result2.items["worker"].status == Status.STALE
+
+    def test_callback_exception_does_not_affect_other_checks(self):
+        """Test that one check exception doesn't affect other check execution."""
+        watchdog = Watchdog()
+
+        def failing_check():
+            raise RuntimeError("check failed")
+
+        def passing_check():
+            return True
+
+        watchdog.register_check("bad", check=failing_check, interval_seconds=30)
+        watchdog.register_check("good", check=passing_check, interval_seconds=30)
+
+        eval_result = watchdog.evaluate()
+
+        # Both should be evaluated despite one failing
+        assert eval_result.items["bad"].status == Status.FAILED
+        assert eval_result.items["bad"].last_error is not None
+        assert eval_result.items["good"].status == Status.HEALTHY
+        assert eval_result.items["good"].last_error is None
+
+
+class TestMalformedNumericInput:
+    """Test handling of malformed numeric input."""
+
+    def test_reject_string_interval(self):
+        """Test that string timeout is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds="60")  # type: ignore
+
+    def test_reject_none_interval(self):
+        """Test that None interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=None)  # type: ignore
+
+    def test_reject_negative_interval(self):
+        """Test that negative interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=-1.0)
+
+    def test_reject_zero_interval(self):
+        """Test that zero interval is rejected."""
+        watchdog = Watchdog()
+        with pytest.raises(InvalidIntervalError):
+            watchdog.register_heartbeat("worker", timeout_seconds=0.0)
+
+
+class TestBoundedHistoryEviction:
+    """Test that history is actually bounded and old events evicted."""
+
+    def test_history_truly_bounded_at_max(self):
+        """Test that history is capped at MAX_HISTORY_EVENTS."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_heartbeat("hb", timeout_seconds=1)
+
+        # Generate enough transitions to exceed MAX_HISTORY_EVENTS
+        # Each heartbeat + state change can generate a transition
+        # We need to create enough state changes
+        for i in range(watchdog.MAX_HISTORY_EVENTS + 100):
+            clock_time[0] = i * 2.0
+            if i % 2 == 0:
+                watchdog.heartbeat("hb")
+            else:
+                # Skip heartbeat to create STALE -> UNKNOWN transitions
+                pass
+            watchdog.evaluate()
+
+        history = watchdog.get_history()
+        # History should be bounded at MAX_HISTORY_EVENTS
+        assert len(history) <= watchdog.MAX_HISTORY_EVENTS
+        # Should have exactly MAX_HISTORY_EVENTS (deque is full)
+        assert len(history) == watchdog.MAX_HISTORY_EVENTS
+
+    def test_oldest_events_actually_removed(self):
+        """Test that oldest transitions are removed when limit exceeded."""
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+        watchdog.register_heartbeat("hb", timeout_seconds=1)
+
+        # Generate first transition at time 0
+        clock_time[0] = 0.0
+        watchdog.heartbeat("hb")
+        eval1 = watchdog.evaluate()
+        first_timestamp = eval1.transitions[0].timestamp if eval1.transitions else None
+
+        # Generate many transitions to exceed MAX_HISTORY_EVENTS
+        for i in range(watchdog.MAX_HISTORY_EVENTS + 100):
+            clock_time[0] = 100 + i * 2.0
+            if i % 2 == 0:
+                watchdog.heartbeat("hb")
+            watchdog.evaluate()
+
+        history = watchdog.get_history()
+        # The oldest event should NOT be the first one we created
+        # (it should have been evicted)
+        if first_timestamp is not None and len(history) > 0:
+            assert history[0].timestamp > first_timestamp

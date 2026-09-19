@@ -1,11 +1,13 @@
 """Core watchdog implementation for cooperative health monitoring."""
 
+import math
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 
@@ -28,9 +30,13 @@ class Transition(NamedTuple):
     reason: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class ItemStatus:
-    """Current status of a single monitored item."""
+    """Current status of a single monitored item.
+
+    For heartbeats: last_heartbeat is when the heartbeat was recorded.
+    For checks: last_check_time is when the check was executed (during evaluate()).
+    """
 
     name: str
     status: Status
@@ -39,13 +45,17 @@ class ItemStatus:
     last_error: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Evaluation:
-    """Result of evaluating watchdog state at a point in time."""
+    """Result of evaluating watchdog state at a point in time.
+
+    Immutable snapshot of watchdog state. items is a read-only mapping,
+    and transitions is a read-only sequence.
+    """
 
     timestamp: float
-    items: dict[str, ItemStatus] = field(default_factory=dict)
-    transitions: list[Transition] = field(default_factory=list)
+    items: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
+    transitions: tuple[Transition, ...] = field(default_factory=tuple)
 
     def is_healthy(self) -> bool:
         """Return True if all items are healthy."""
@@ -100,14 +110,21 @@ class Watchdog:
     ) -> None:
         """Register a health check.
 
+        The check is executed synchronously on every evaluate() call.
+        The interval_seconds parameter is metadata for your application;
+        it is not enforced by the watchdog.
+
         Args:
             name: Unique name for this check.
-            check: Callable that returns True if healthy.
-            interval_seconds: Expected frequency of checks.
+            check: Callable that returns True if healthy, False if failed.
+                   Must return strictly bool (not truthy/falsy).
+            interval_seconds: Metadata: your application can use this when deciding
+                            how often to call evaluate(). The watchdog does not throttle
+                            based on this value.
 
         Raises:
             InvalidNameError: If name is empty or contains invalid characters.
-            InvalidIntervalError: If interval is invalid.
+            InvalidIntervalError: If interval is not a finite positive real number.
             ValueError: If name is already registered.
         """
         self._validate_name(name)
@@ -166,25 +183,62 @@ class Watchdog:
     def evaluate(self) -> Evaluation:
         """Evaluate current watchdog state.
 
-        Returns:
-            Evaluation containing item statuses and any state transitions.
-        """
-        current_time = self._clock()
+        Synchronously executes all registered health checks and evaluates
+        all heartbeats against their timeouts. The returned snapshot captures
+        state at the moment the clock was sampled.
 
+        Callbacks are executed outside the internal lock to avoid blocking
+        heartbeat recording or other concurrent operations.
+
+        Returns:
+            Evaluation containing item statuses and any state transitions that
+            occurred since the last call to evaluate().
+        """
+        # Phase 1: Acquire lock, sample time, copy check functions
+        with self._lock:
+            current_time = self._clock()
+            # Copy check functions and names to execute outside the lock
+            checks_to_run = [
+                (name, check_cfg["check"]) for name, check_cfg in self._checks.items()
+            ]
+
+        # Phase 2: Execute callbacks outside the lock (won't block heartbeats)
+        check_results: dict[str, tuple[Status, str | None]] = {}
+        for name, check_fn in checks_to_run:
+            # Run callback without holding lock
+            try:
+                result = check_fn()
+                if not isinstance(result, bool):
+                    error_text = f"Check must return bool, got {type(result).__name__}"
+                    check_results[name] = (Status.FAILED, error_text)
+                elif result:
+                    check_results[name] = (Status.HEALTHY, None)
+                else:
+                    check_results[name] = (Status.FAILED, None)
+            except Exception as e:  # noqa: BLE001
+                exc_name = type(e).__name__
+                exc_msg = str(e)
+                max_msg_len = max(1, 115 - len(exc_name) - 2)
+                error_text = f"{exc_name}: {exc_msg[:max_msg_len]}"
+                check_results[name] = (Status.FAILED, error_text)
+
+        # Phase 3: Acquire lock again to record results and return snapshot
         with self._lock:
             statuses: dict[str, ItemStatus] = {}
             new_transitions: list[Transition] = []
 
-            # Evaluate health checks
-            for name, check_cfg in self._checks.items():
-                status, error = self._eval_check(
-                    name, check_cfg, current_time
-                )
+            # Process evaluated checks
+            for name in self._checks:
+                if name in check_results:
+                    status, error = check_results[name]
+                    self._checks[name]["last_check_time"] = current_time
+                else:
+                    status, error = Status.UNKNOWN, None
                 self._record_transition(name, status, new_transitions, current_time)
                 statuses[name] = ItemStatus(
                     name=name,
                     status=status,
-                    last_check_time=check_cfg["last_check_time"],
+                    last_check_time=self._checks[name]["last_check_time"],
                     last_error=error,
                 )
 
@@ -203,8 +257,8 @@ class Watchdog:
 
             return Evaluation(
                 timestamp=current_time,
-                items=statuses,
-                transitions=new_transitions,
+                items=MappingProxyType(statuses),
+                transitions=tuple(new_transitions),
             )
 
     def get_history(self) -> list[Transition]:
@@ -215,29 +269,6 @@ class Watchdog:
         """
         with self._lock:
             return list(self._transitions)
-
-    def _eval_check(
-        self, name: str, check_cfg: dict[str, Any], current_time: float
-    ) -> tuple[Status, str | None]:
-        """Evaluate a single health check.
-
-        Returns:
-            (status, error_text or None)
-        """
-        try:
-            result = check_cfg["check"]()
-            check_cfg["last_check_time"] = current_time
-            if result:
-                return Status.HEALTHY, None
-            else:
-                return Status.FAILED, None
-        except Exception as e:  # noqa: BLE001
-            check_cfg["last_check_time"] = current_time
-            exc_name = type(e).__name__
-            exc_msg = str(e)
-            max_msg_len = max(1, 115 - len(exc_name) - 2)
-            error_text = f"{exc_name}: {exc_msg[:max_msg_len]}"
-            return Status.FAILED, error_text
 
     def _eval_heartbeat(
         self, name: str, hb_cfg: dict[str, Any], current_time: float
@@ -302,9 +333,13 @@ class Watchdog:
         """Validate an interval or timeout value.
 
         Raises:
-            InvalidIntervalError: If value is not positive.
+            InvalidIntervalError: If value is not a finite positive real number.
         """
-        if value <= 0:
+        if isinstance(value, bool):
+            raise InvalidIntervalError(f"Interval must be >0; got {value}")
+        if not isinstance(value, (int, float)):
+            raise InvalidIntervalError(f"Interval must be >0; got {value}")
+        if math.isnan(value) or math.isinf(value) or value <= 0:
             raise InvalidIntervalError(f"Interval must be >0; got {value}")
 
     def _check_name_available(self, name: str) -> None:
