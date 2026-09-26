@@ -224,6 +224,11 @@ class Watchdog:
 
         # Phase 3: Acquire lock again to record results and return snapshot
         with self._lock:
+            # Sample clock again after callbacks to fix timestamp race: a heartbeat
+            # recorded during Phase 2 may have a timestamp later than Phase 1's current_time.
+            # Use final_time for heartbeats and Evaluation.timestamp; current_time is kept
+            # only for check-evaluation timestamps.
+            final_time = self._clock()
             statuses: dict[str, ItemStatus] = {}
             new_transitions: list[Transition] = []
 
@@ -242,10 +247,10 @@ class Watchdog:
                     last_error=error,
                 )
 
-            # Evaluate heartbeats
+            # Evaluate heartbeats using final_time to account for heartbeats recorded during Phase 2
             for name, hb_cfg in self._heartbeats.items():
-                status, _ = self._eval_heartbeat(name, hb_cfg, current_time)
-                self._record_transition(name, status, new_transitions, current_time)
+                status, _ = self._eval_heartbeat(name, hb_cfg, final_time)
+                self._record_transition(name, status, new_transitions, final_time)
                 statuses[name] = ItemStatus(
                     name=name,
                     status=status,
@@ -256,7 +261,7 @@ class Watchdog:
             self._transitions.extend(new_transitions)
 
             return Evaluation(
-                timestamp=current_time,
+                timestamp=final_time,
                 items=MappingProxyType(statuses),
                 transitions=tuple(new_transitions),
             )

@@ -5,7 +5,7 @@
 Install dependencies and development tools:
 
 ```bash
-uv sync
+uv sync --all-extras --locked
 ```
 
 ## Testing
@@ -13,19 +13,19 @@ uv sync
 Run the test suite:
 
 ```bash
-uv run pytest
+uv run --locked pytest
 ```
 
 Run tests with verbose output:
 
 ```bash
-uv run pytest -v
+uv run --locked pytest -v
 ```
 
 Run a specific test:
 
 ```bash
-uv run pytest tests/test_watchdog.py::TestHeartbeatBasics::test_register_heartbeat
+uv run --locked pytest tests/test_watchdog.py::TestHeartbeatBasics::test_register_heartbeat
 ```
 
 ## Code style
@@ -33,16 +33,16 @@ uv run pytest tests/test_watchdog.py::TestHeartbeatBasics::test_register_heartbe
 This project uses `ruff` for linting:
 
 ```bash
-uv run ruff check src/ tests/
-uv run ruff format src/ tests/
+uv run --locked ruff check src/ tests/
+uv run --locked ruff format src/ tests/
 ```
 
 ## Before submitting
 
 1. Write tests for new features
-2. Ensure all tests pass: `uv run pytest`
-3. Lint your changes: `uv run ruff check src/ tests/`
-4. Format code: `uv run ruff format src/ tests/`
+2. Ensure all tests pass: `uv run --locked pytest`
+3. Lint your changes: `uv run --locked ruff check src/ tests/`
+4. Format code: `uv run --locked ruff format src/ tests/`
 5. Verify imports work from the public API
 
 ## Design principles

@@ -866,6 +866,73 @@ class TestConcurrentSafety:
         eval_result2 = watchdog.evaluate()
         assert eval_result2.items["worker"].status == Status.STALE
 
+    def test_heartbeat_during_callback_not_unknown(self):
+        """Regression test: heartbeat recorded during callback should not be UNKNOWN.
+
+        This tests the fix for the concurrent heartbeat timestamp race:
+        - evaluate() samples current_time at Phase 1 start
+        - callback blocks outside lock during Phase 2
+        - heartbeat is recorded during Phase 2 (timestamp later than Phase 1 sample)
+        - Phase 3 re-samples clock and uses final_time for heartbeat evaluation
+        - heartbeat should be HEALTHY (not UNKNOWN due to negative elapsed time)
+        """
+        import threading
+
+        clock_time = [0.0]
+
+        def clock():
+            return clock_time[0]
+
+        watchdog = Watchdog(monotonic_clock=clock)
+
+        # Register a slow check and heartbeat
+        check_started = threading.Event()
+        check_finish = threading.Event()
+
+        def slow_check():
+            check_started.set()
+            check_finish.wait(timeout=5.0)
+            return True
+
+        watchdog.register_check("slow", check=slow_check, interval_seconds=30)
+        watchdog.register_heartbeat("worker", timeout_seconds=60)
+
+        # Record initial heartbeat before evaluation
+        clock_time[0] = 5.0
+        watchdog.heartbeat("worker")
+
+        results = []
+
+        def evaluate_thread():
+            clock_time[0] = 10.0  # Evaluation starts at t=10.0
+            results.append(watchdog.evaluate())
+
+        def heartbeat_thread():
+            # Wait for check to start blocking
+            check_started.wait(timeout=5.0)
+            # Record heartbeat at t=15.0 (after evaluation Phase 1 sample)
+            clock_time[0] = 15.0
+            watchdog.heartbeat("worker")
+            # Let check complete
+            check_finish.set()
+
+        eval_t = threading.Thread(target=evaluate_thread)
+        beat_t = threading.Thread(target=heartbeat_thread)
+
+        eval_t.start()
+        beat_t.start()
+
+        eval_t.join(timeout=5.0)
+        beat_t.join(timeout=5.0)
+
+        # Heartbeat should be HEALTHY, not UNKNOWN
+        # (before fix: would be UNKNOWN due to negative elapsed time)
+        assert len(results) == 1
+        assert results[0].items["worker"].status == Status.HEALTHY
+        assert results[0].items["worker"].last_heartbeat == 15.0
+        # Evaluation timestamp should be at or after the heartbeat was recorded
+        assert results[0].timestamp >= 15.0
+
     def test_callback_exception_does_not_affect_other_checks(self):
         """Test that one check exception doesn't affect other check execution."""
         watchdog = Watchdog()
